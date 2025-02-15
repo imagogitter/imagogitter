@@ -1,0 +1,86 @@
+#!/bin/bash
+
+# Usage: chunker.sh <command> [chunk_size] [timeout]
+# Example: cat file.txt | ./chunker.sh "grep ERROR" 100 60 | sort -u
+
+# Default settings
+CHUNK_SIZE=100      # Default: 100 lines per chunk
+TIMEOUT=60          # Default: 60 seconds per chunk
+LOGFILE="/var/log/chunk.log"  # Log file location
+MAX_RETRIES=3       # Max retries per chunk
+
+# Ensure a command is provided
+if [[ -z "$1" ]]; then
+    echo "Usage: chunk <command> [chunk_size] [timeout]" >&2
+    exit 1
+fi
+
+CMD="$1"  # Command to execute on each chunk
+
+# Optionally override chunk_size and timeout if provided
+if [[ -n "$2" ]]; then
+    CHUNK_SIZE="$2"
+fi
+
+if [[ -n "$3" ]]; then
+    TIMEOUT="$3"
+fi
+
+# Check for write permissions on the log file
+if [[ ! -w "$LOGFILE" ]]; then
+    sudo touch "$LOGFILE"
+    sudo chmod 666 "$LOGFILE"
+fi
+
+# Logging function
+log() {
+    local message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$message" | sudo tee -a "$LOGFILE" >/dev/null
+    logger -t chunker "$1"  # Send to syslog
+}
+
+# Main processing logic with AWK
+awk -v n="$CHUNK_SIZE" -v cmd="$CMD" -v log="$LOGFILE" -v timeout="$TIMEOUT" -v retries="$MAX_RETRIES" '
+{
+    buffer = buffer $0 ORS;
+    if (NR % n == 0) {
+        process_chunk();
+        buffer = "";
+    }
+}
+END {
+    if (buffer) {
+        process_chunk();
+    }
+}
+
+function process_chunk() {
+    chunk_id = ++chunk_count;
+    system("echo \"Processing chunk #" chunk_id "\" | tee -a " log);
+
+    # Attempt up to MAX_RETRIES times
+    for (attempt = 1; attempt <= retries; attempt++) {
+        cmd_pid = (print buffer | cmd) 2>> log &
+
+        # Wait for completion or kill if it times out
+        start_time = systime();
+        while (systime() - start_time < timeout) {
+            if (system("ps -p " cmd_pid " > /dev/null 2>&1") != 0) {
+                return;  # Command finished successfully
+            }
+            system("sleep 1");
+        }
+
+        # Kill process if it exceeded the timeout
+        system("kill -9 " cmd_pid " 2>/dev/null");
+        system("echo \"Chunk #" chunk_id " timed out, retrying (" attempt "/" retries ")\" | tee -a " log);
+    }
+
+    # Final failure log
+    system("echo \"Chunk #" chunk_id " failed after " retries " attempts\" | tee -a " log);
+}'
+
+wait  # Ensure all backgrounded processes finish
+
+log "All chunks processed."
+
